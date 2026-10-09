@@ -1,0 +1,55 @@
+name: wagering
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: wagering
+      POSTGRES_PASSWORD: wagering
+      POSTGRES_DB: wagering
+    ports: ["5433:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wagering -d wagering"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  localstack:
+    image: localstack/localstack:4.4
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: us-east-1
+    ports: ["4566:4566"]
+    volumes:
+      - ./infra/localstack/init-sqs.sh:/etc/localstack/init/ready.d/init-sqs.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal sqs get-queue-url --queue-name wager-transactions.fifo"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  # 3 instâncias da aplicação contra o mesmo banco/fila (seção 8).
+  app:
+    build: .
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      INSTANCE_ID: ""
+      DATABASE_URL: postgres://wagering:wagering@postgres:5432/wagering
+      SQS_ENDPOINT: http://localstack:4566
+      SQS_WAGER_QUEUE_URL: http://localstack:4566/000000000000/wager-transactions.fifo
+      SQS_WAGER_DLQ_URL: http://localstack:4566/000000000000/wager-transactions-dlq.fifo
+      SQS_EVENTS_QUEUE_URL: http://localstack:4566/000000000000/wagering-events.fifo
+    deploy:
+      replicas: 3
+    ports: ["3000-3002:3000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      localstack: { condition: service_healthy }
+    profiles: ["app"]
+
+volumes:
+  pgdata:

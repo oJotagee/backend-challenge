@@ -1,0 +1,169 @@
+### Requisições prontas para testar a API manualmente.
+### VS Code: instale a extensão "REST Client" (humao.rest-client) e clique em "Send Request"
+### acima de cada bloco. JetBrains (WebStorm/IntelliJ): suporte nativo.
+###
+### Antes: bun run infra:up · bun run migrate · bun run dev  (ou bun run app:up para 3 réplicas)
+
+@base = http://localhost:3000
+@playerId = e07c7c76-6831-43ed-9419-42c6957a745f
+@walletId = 01a122a2-9e42-7bb4-b2bc-fddab1a80d7f
+
+### 1. Health (abertos, sem autenticação)
+GET {{base}}/health/live
+
+###
+GET {{base}}/health/ready
+
+### 2. Criar wallet — guarda o id em walletId para as próximas requisições
+# @name wallet
+POST {{base}}/wallets
+Content-Type: application/json
+
+{
+  "playerId": "{{playerId}}",
+  "initialBalance": { "amount": "1000.00", "currency": "BRL" }
+}
+
+###
+
+### 3. Criar a MESMA wallet de novo → 409 WALLET_ALREADY_EXISTS
+POST {{base}}/wallets
+Content-Type: application/json
+
+{
+  "playerId": "{{playerId}}",
+  "initialBalance": { "amount": "1000.00", "currency": "BRL" }
+}
+
+### 4. Consultar a wallet
+GET {{base}}/wallets/{{walletId}}
+
+### 5. BET de 25.00 → 201 PROCESSED, saldo 975.00
+# @name bet
+POST {{base}}/wagering/transactions
+Content-Type: application/json
+Idempotency-Key: provider-b:bet-1
+
+{
+  "providerId": "provider-b",
+  "externalTransactionId": "bet-1",
+  "playerId": "{{playerId}}",
+  "walletId": "{{walletId}}",
+  "roundId": "round-1",
+  "gameId": "fortune-chimp",
+  "kind": "BET",
+  "money": { "amount": "25.00", "currency": "BRL" }
+}
+
+### 6. Reenviar a MESMA BET → 200, mesmo corpo, "idempotentReplay": true (não debita de novo)
+POST {{base}}/wagering/transactions
+Content-Type: application/json
+Idempotency-Key: provider-b:bet-1
+
+{
+  "providerId": "provider-b",
+  "externalTransactionId": "bet-1",
+  "playerId": "{{playerId}}",
+  "walletId": "{{walletId}}",
+  "roundId": "round-1",
+  "gameId": "fortune-chimp",
+  "kind": "BET",
+  "money": { "amount": "25.00", "currency": "BRL" }
+}
+
+### 7. Mesma key com valor DIFERENTE → 409 IDEMPOTENCY_KEY_CONFLICT
+POST {{base}}/wagering/transactions
+Content-Type: application/json
+Idempotency-Key: provider-b:bet-1
+
+{
+  "providerId": "provider-b",
+  "externalTransactionId": "bet-1",
+  "playerId": "{{playerId}}",
+  "walletId": "{{walletId}}",
+  "roundId": "round-1",
+  "gameId": "fortune-chimp",
+  "kind": "BET",
+  "money": { "amount": "99.00", "currency": "BRL" }
+}
+
+### 8. BET maior que o saldo → 422 REJECTED, failureCode INSUFFICIENT_FUNDS
+POST {{base}}/wagering/transactions
+Content-Type: application/json
+Idempotency-Key: provider-b:bet-too-big
+
+{
+  "providerId": "provider-b",
+  "externalTransactionId": "bet-too-big",
+  "playerId": "{{playerId}}",
+  "walletId": "{{walletId}}",
+  "roundId": "round-1",
+  "gameId": "fortune-chimp",
+  "kind": "BET",
+  "money": { "amount": "999999.00", "currency": "BRL" }
+}
+
+### 9. REFUND de uma BET que ainda não chegou → 202 PENDING_REFERENCE
+POST {{base}}/wagering/transactions
+Content-Type: application/json
+Idempotency-Key: provider-b:refund-2
+
+{
+  "providerId": "provider-b",
+  "externalTransactionId": "refund-2",
+  "referenceExternalTransactionId": "bet-2",
+  "playerId": "{{playerId}}",
+  "walletId": "{{walletId}}",
+  "roundId": "round-2",
+  "gameId": "fortune-chimp",
+  "kind": "REFUND",
+  "money": { "amount": "10.00", "currency": "BRL" }
+}
+
+### 10. A BET referenciada chega → 201. Em ~1s o worker aplica o REFUND (consulte o item 12)
+POST {{base}}/wagering/transactions
+Content-Type: application/json
+Idempotency-Key: provider-b:bet-2
+
+{
+  "providerId": "provider-b",
+  "externalTransactionId": "bet-2",
+  "playerId": "{{playerId}}",
+  "walletId": "{{walletId}}",
+  "roundId": "round-2",
+  "gameId": "fortune-chimp",
+  "kind": "BET",
+  "money": { "amount": "10.00", "currency": "BRL" }
+}
+
+### 11. Transação pelo id interno (do item 5)
+# GET {{base}}/wagering/transactions/{{bet.transactionId}}
+GET {{base}}/wagering/transactions/01a122a5-6300-729d-8485-d6a19ec46c0f
+
+### 12. Transação pelo id do provedor — o REFUND do item 9 deve estar PROCESSED
+GET {{base}}/providers/provider-b/wagering/transactions/refund-2
+
+### 13. Ledger (paginado; use o nextCursor da resposta em ?cursor=)
+GET {{base}}/wallets/{{walletId}}/ledger?limit=2
+
+### 14. Reconciliação: saldo × ledger → "consistent": true
+POST {{base}}/wallets/{{walletId}}/reconciliation
+
+### 15. Payload inválido → 400 (notação científica no valor)
+POST {{base}}/wagering/transactions
+Content-Type: application/json
+Idempotency-Key: provider-a:bad-1
+
+{
+  "providerId": "provider-a",
+  "externalTransactionId": "bad-1",
+  "playerId": "{{playerId}}",
+  "walletId": "{{walletId}}",
+  "roundId": "round-1",
+  "gameId": "fortune-chimp",
+  "kind": "BET",
+  "money": { "amount": "1e3", "currency": "BRL" }
+}
+
+### 16. Métricas Prometheus
+GET {{base}}/metrics
